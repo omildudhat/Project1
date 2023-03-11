@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/olekukonko/tablewriter"
 )
+
+
+var ErrInvalidArgs error = errors.New("invalid arguments")
 
 func main() {
 	// CLI args
@@ -30,11 +34,14 @@ func main() {
 	// First-come, first-serve scheduling
 	FCFSSchedule(os.Stdout, "First-come, first-serve", processes)
 
-	//SJFSchedule(os.Stdout, "Shortest-job-first", processes)
-	//
-	//SJFPrioritySchedule(os.Stdout, "Priority", processes)
-	//
-	//RRSchedule(os.Stdout, "Round-robin", processes)
+	// Shortest Job First (SJF) scheduling
+	SJFSchedule(os.Stdout, "Shortest-job-first (SJF)", processes)
+
+	// SJF with Priority scheduling
+	SJFPrioritySchedule(os.Stdout, "SJF with Priority scheduling", processes)
+
+	// Round-robin scheduling
+	RRSchedule(os.Stdout, "Round-robin scheduling", processes)
 }
 
 func openProcessingFile(args ...string) (*os.File, func(), error) {
@@ -129,9 +136,270 @@ func FCFSSchedule(w io.Writer, title string, processes []Process) {
 
 //func SJFPrioritySchedule(w io.Writer, title string, processes []Process) { }
 //
+func SJFPrioritySchedule(w io.Writer, title string, processes []Process) {
+	var (
+		serviceTime     int64
+		totalWait       float64
+		totalTurnaround float64
+		lastCompletion  float64
+		waitingTime     int64
+		schedule        = make([][]string, len(processes))
+		gantt           = make([]TimeSlice, 0)
+		remaining       = make([]Process, len(processes))
+	)
+
+	copy(remaining, processes)
+	sort.Slice(remaining, func(i, j int) bool {
+		if remaining[i].BurstDuration == remaining[j].BurstDuration {
+			return remaining[i].Priority < remaining[j].Priority
+		}
+		return remaining[i].BurstDuration < remaining[j].BurstDuration
+	})
+
+	var running Process
+	for len(remaining) > 0 || running.ProcessID != 0 {
+		// add any arriving processes to the queue
+		for len(remaining) > 0 && remaining[0].ArrivalTime <= serviceTime {
+			if remaining[0].Priority < running.Priority {
+				// preempt the running process if a higher-priority process arrives
+				if running.ProcessID != 0 {
+					queue := append([]Process{running}, remaining[0])
+					remaining = append(remaining[1:], queue...)
+				} else {
+					running = remaining[0]
+				}
+			} else {
+				remaining = append(remaining[1:], remaining[0])
+			}
+		}
+
+		if running.ProcessID == 0 {
+			// wait for the next process to arrive
+			running = remaining[0]
+			remaining = remaining[1:]
+			waitingTime = serviceTime - running.ArrivalTime
+			totalWait += float64(waitingTime)
+		}
+
+		start := serviceTime
+
+		// execute the process for a fixed time slice
+		if running.BurstDuration > 0 {
+			running.BurstDuration--
+			serviceTime++
+			if running.BurstDuration == 0 {
+				turnaround := waitingTime + running.BurstDuration + 1
+				totalTurnaround += float64(turnaround)
+				completion := serviceTime
+				lastCompletion = float64(completion)
+				schedule[running.ProcessID-1] = []string{
+					fmt.Sprint(running.ProcessID),
+					fmt.Sprint(running.Priority),
+					fmt.Sprint(running.BurstDuration),
+					fmt.Sprint(running.ArrivalTime),
+					fmt.Sprint(waitingTime),
+					fmt.Sprint(turnaround),
+					fmt.Sprint(completion),
+				}
+				running = Process{}
+			}
+		} else {
+			// process has finished executing
+			turnaround := waitingTime + running.BurstDuration + 1
+			totalTurnaround += float64(turnaround)
+			completion := serviceTime
+			lastCompletion = float64(completion)
+			schedule[running.ProcessID-1] = []string{
+				fmt.Sprint(running.ProcessID),
+				fmt.Sprint(running.Priority),
+				fmt.Sprint(running.BurstDuration),
+				fmt.Sprint(running.ArrivalTime),
+				fmt.Sprint(waitingTime),
+				fmt.Sprint(turnaround),
+				fmt.Sprint(completion),
+			}
+			running = Process{}
+		}
+
+		gantt = append(gantt, TimeSlice{
+			PID:   running.ProcessID,
+			Start: start,
+			Stop:  serviceTime,
+		})
+	}
+
+	count := float64(len(processes))
+	aveWait := totalWait / count
+	aveTurnaround := totalTurnaround / count
+	aveThroughput := count / lastCompletion
+
+	outputTitle(w, title)
+	outputGantt(w, gantt)
+	outputSchedule(w, schedule, aveWait, aveTurnaround, aveThroughput)
+}
+
 //func SJFSchedule(w io.Writer, title string, processes []Process) { }
 //
+func SJFSchedule(w io.Writer, title string, processes []Process) {
+	var (
+		serviceTime     int64
+		totalWait       float64
+		totalTurnaround float64
+		lastCompletion  float64
+		waitingTime     int64
+		schedule        = make([][]string, len(processes))
+		gantt           = make([]TimeSlice, 0)
+		remaining       = make([]Process, len(processes))
+	)
+
+	copy(remaining, processes)
+	sort.Slice(remaining, func(i, j int) bool {
+		return remaining[i].BurstDuration < remaining[j].BurstDuration
+	})
+
+	for len(remaining) > 0 {
+		var next Process
+		if len(remaining) == 1 || remaining[0].ArrivalTime <= serviceTime {
+			next = remaining[0]
+			remaining = remaining[1:]
+		} else {
+			// find the process with the shortest burst time that has arrived
+			for i, p := range remaining {
+				if p.ArrivalTime > serviceTime {
+					break
+				}
+				if p.BurstDuration < next.BurstDuration || next.ProcessID == 0 {
+					next = remaining[i]
+				}
+			}
+			remaining = removeProcess(remaining, next)
+		}
+
+		if next.ProcessID != 0 {
+			if next.ArrivalTime > 0 {
+				waitingTime = serviceTime - next.ArrivalTime
+			}
+			totalWait += float64(waitingTime)
+
+			start := waitingTime + next.ArrivalTime
+
+			turnaround := next.BurstDuration + waitingTime
+			totalTurnaround += float64(turnaround)
+
+			completion := next.BurstDuration + next.ArrivalTime + waitingTime
+			lastCompletion = float64(completion)
+
+			schedule[next.ProcessID-1] = []string{
+				fmt.Sprint(next.ProcessID),
+				fmt.Sprint(next.Priority),
+				fmt.Sprint(next.BurstDuration),
+				fmt.Sprint(next.ArrivalTime),
+				fmt.Sprint(waitingTime),
+				fmt.Sprint(turnaround),
+				fmt.Sprint(completion),
+			}
+			serviceTime += next.BurstDuration
+
+			gantt = append(gantt, TimeSlice{
+				PID:   next.ProcessID,
+				Start: start,
+				Stop:  serviceTime,
+			})
+		}
+	}
+
+	count := float64(len(processes))
+	aveWait := totalWait / count
+	aveTurnaround := totalTurnaround / count
+	aveThroughput := count / lastCompletion
+
+	outputTitle(w, title)
+	outputGantt(w, gantt)
+	outputSchedule(w, schedule, aveWait, aveTurnaround, aveThroughput)
+}
+
 //func RRSchedule(w io.Writer, title string, processes []Process) { }
+
+func RRSchedule(w io.Writer, title string, processes []Process) {
+	const quantum = 2 // fixed time slice
+
+	var (
+		serviceTime     int64
+		totalWait       float64
+		totalTurnaround float64
+		lastCompletion  float64
+		waitingTime     int64
+		schedule        = make([][]string, len(processes))
+		gantt           = make([]TimeSlice, 0)
+		remaining       = make([]Process, len(processes))
+		queue           = make([]Process, 0)
+	)
+
+	copy(remaining, processes)
+
+	for len(remaining) > 0 || len(queue) > 0 {
+		// add any arriving processes to the queue
+		for len(remaining) > 0 && remaining[0].ArrivalTime <= serviceTime {
+			queue = append(queue, remaining[0])
+			remaining = remaining[1:]
+		}
+
+		if len(queue) == 0 {
+			// wait for the next process to arrive
+			serviceTime = remaining[0].ArrivalTime
+		} else {
+			p := queue[0]
+			queue = queue[1:]
+
+			if p.ArrivalTime > 0 {
+				waitingTime = serviceTime - p.ArrivalTime
+			}
+			totalWait += float64(waitingTime)
+
+			start := waitingTime + p.ArrivalTime
+
+			var completion int64
+			if p.BurstDuration > quantum {
+				p.BurstDuration -= quantum
+				completion = serviceTime + quantum
+				queue = append(queue, p)
+			} else {
+				completion = serviceTime + p.BurstDuration
+				p.BurstDuration = 0
+				lastCompletion = float64(completion)
+			}
+
+			turnaround := p.BurstDuration + waitingTime
+			totalTurnaround += float64(turnaround)
+
+			schedule[p.ProcessID-1] = []string{
+				fmt.Sprint(p.ProcessID),
+				fmt.Sprint(p.Priority),
+				fmt.Sprint(p.BurstDuration),
+				fmt.Sprint(p.ArrivalTime),
+				fmt.Sprint(waitingTime),
+				fmt.Sprint(turnaround),
+				fmt.Sprint(completion),
+			}
+			serviceTime += quantum
+
+			gantt = append(gantt, TimeSlice{
+				PID:   p.ProcessID,
+				Start: start,
+				Stop:  serviceTime,
+			})
+		}
+	}
+
+	count := float64(len(processes))
+	aveWait := totalWait / count
+	aveTurnaround := totalTurnaround / count
+	aveThroughput := count / lastCompletion
+
+	outputTitle(w, title)
+	outputGantt(w, gantt)
+	outputSchedule(w, schedule, aveWait, aveTurnaround, aveThroughput)
+}
 
 //endregion
 
@@ -173,10 +441,6 @@ func outputSchedule(w io.Writer, rows [][]string, wait, turnaround, throughput f
 	table.Render()
 }
 
-//endregion
-
-//region Loading processes.
-
 var ErrInvalidArgs = errors.New("invalid args")
 
 func loadProcesses(r io.Reader) ([]Process, error) {
@@ -207,5 +471,3 @@ func mustStrToInt(s string) int64 {
 
 	return i
 }
-
-//endregion
